@@ -7,14 +7,13 @@ import java.io.ByteArrayInputStream;
 import java.net.URI;
 
 import org.hamcrest.core.IsInstanceOf;
+import org.hamcrest.core.IsNull;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 import org.mockito.Matchers;
 import org.mockito.Mockito;
 import org.springframework.boot.test.EnvironmentTestUtils;
-import org.springframework.cloud.config.client.ConfigClientProperties;
-import org.springframework.cloud.config.client.ConfigServicePropertySourceLocator;
 import org.springframework.cloud.config.environment.Environment;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.StandardEnvironment;
@@ -27,6 +26,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.ClientHttpRequest;
 import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestTemplate;
 
@@ -54,11 +54,20 @@ public class ConfigServicePropertySourceLocatorTests {
 	@Test
 	public void sunnyDayWithLabel() {
 		Environment body = new Environment("app", "master");
-		mockRequestResponseWithLabel(new ResponseEntity<Environment>(body,
-				HttpStatus.OK), "v1.0.0");
+		mockRequestResponseWithLabel(
+				new ResponseEntity<Environment>(body, HttpStatus.OK), "v1.0.0");
 		locator.setRestTemplate(restTemplate);
-		EnvironmentTestUtils.addEnvironment(environment, "spring.cloud.config.label:v1.0.0");
+		EnvironmentTestUtils.addEnvironment(environment,
+				"spring.cloud.config.label:v1.0.0");
 		assertNotNull(locator.locate(environment));
+	}
+
+	@Test
+	public void sunnyDayWithNoSuchLabel() {
+		mockRequestResponseWithLabel(new ResponseEntity<Void>((Void) null,
+				HttpStatus.NOT_FOUND), "nosuchlabel");
+		locator.setRestTemplate(restTemplate);
+		assertNull(locator.locate(environment));
 	}
 
 	@Test
@@ -94,6 +103,34 @@ public class ConfigServicePropertySourceLocatorTests {
 		locator.setRestTemplate(restTemplate);
 		expected.expectCause(IsInstanceOf
 				.<Throwable> instanceOf(HttpServerErrorException.class));
+		expected.expectMessage("fail fast property is set");
+		assertNull(locator.locate(environment));
+	}
+
+	@Test
+	public void failFastWhenNotFound() throws Exception {
+		ClientHttpRequestFactory requestFactory = Mockito
+				.mock(ClientHttpRequestFactory.class);
+		ClientHttpRequest request = Mockito.mock(ClientHttpRequest.class);
+		ClientHttpResponse response = Mockito.mock(ClientHttpResponse.class);
+		Mockito.when(
+				requestFactory.createRequest(Mockito.any(URI.class),
+						Mockito.any(HttpMethod.class))).thenReturn(request);
+		RestTemplate restTemplate = new RestTemplate(requestFactory);
+		ConfigClientProperties defaults = new ConfigClientProperties(environment);
+		defaults.setFailFast(true);
+		locator = new ConfigServicePropertySourceLocator(defaults);
+		Mockito.when(request.getHeaders()).thenReturn(new HttpHeaders());
+		Mockito.when(request.execute()).thenReturn(response);
+		HttpHeaders headers = new HttpHeaders();
+		headers.setContentType(MediaType.APPLICATION_JSON);
+		Mockito.when(response.getHeaders()).thenReturn(headers);
+		Mockito.when(response.getStatusCode()).thenReturn(
+				HttpStatus.NOT_FOUND);
+		Mockito.when(response.getBody()).thenReturn(
+				new ByteArrayInputStream("".getBytes()));
+		locator.setRestTemplate(restTemplate);
+		expected.expectCause(IsNull.nullValue(Throwable.class));
 		expected.expectMessage("fail fast property is set");
 		assertNull(locator.locate(environment));
 	}

@@ -30,9 +30,9 @@ import org.junit.Test;
 import org.springframework.boot.autoconfigure.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.cloud.config.environment.Environment;
-import org.springframework.cloud.config.server.ConfigServerConfiguration;
 import org.springframework.cloud.config.server.ConfigServerTestUtils;
 import org.springframework.cloud.config.server.EnvironmentRepository;
+import org.springframework.cloud.config.server.config.EnvironmentRepositoryConfiguration;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -107,7 +107,7 @@ public class MultipleJGitEnvironmentRepositoryIntegrationTests {
 	}
 
 	@Configuration
-	@Import({ PropertyPlaceholderAutoConfiguration.class, ConfigServerConfiguration.class })
+	@Import({ PropertyPlaceholderAutoConfiguration.class, EnvironmentRepositoryConfiguration.class })
 	protected static class TestConfiguration {
 	}
 

@@ -13,11 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.springframework.cloud.config.server;
+package org.springframework.cloud.config.server.config;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.cloud.config.server.ConfigServerHealthIndicator;
+import org.springframework.cloud.config.server.ConfigServerProperties;
+import org.springframework.cloud.config.server.EnvironmentRepository;
+import org.springframework.cloud.config.server.MultipleJGitEnvironmentRepository;
+import org.springframework.cloud.config.server.NativeEnvironmentRepository;
+import org.springframework.cloud.config.server.SvnKitEnvironmentRepository;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -30,7 +37,13 @@ import org.springframework.core.env.ConfigurableEnvironment;
 @Configuration
 @ConditionalOnMissingBean(EnvironmentRepository.class)
 @EnableConfigurationProperties(ConfigServerProperties.class)
-public class ConfigServerConfiguration {
+public class EnvironmentRepositoryConfiguration {
+
+	@Bean
+	@ConditionalOnProperty(value = "spring.cloud.config.server.health.enabled", matchIfMissing = true)
+	public ConfigServerHealthIndicator configServerHealthIndicator(EnvironmentRepository repository) {
+		return new ConfigServerHealthIndicator(repository);
+	}
 
 	@Configuration
 	@Profile("native")

@@ -20,6 +20,7 @@ import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -43,7 +44,7 @@ public class ConfigClientAutoConfiguration {
 		if (context.getParent() != null
 				&& BeanFactoryUtils.beanNamesForTypeIncludingAncestors(
 						context.getParent(), ConfigClientProperties.class).length > 0) {
-			return BeanFactoryUtils.beanOfType(context.getParent(),
+			return BeanFactoryUtils.beanOfTypeIncludingAncestors(context.getParent(),
 					ConfigClientProperties.class);
 		}
 		ConfigClientProperties client = new ConfigClientProperties(environment);
@@ -53,13 +54,29 @@ public class ConfigClientAutoConfiguration {
 	@Configuration
 	@ConditionalOnClass(HealthIndicator.class)
 	@ConditionalOnBean(ConfigServicePropertySourceLocator.class)
-	@ConditionalOnProperty(value = "spring.cloud.config.enabled", matchIfMissing = true)
+	@ConditionalOnProperty(value = "health.config.enabled", matchIfMissing = true)
 	protected static class ConfigServerHealthIndicatorConfiguration {
 
 		@Bean
 		public ConfigServerHealthIndicator configServerHealthIndicator(
 				ConfigServicePropertySourceLocator locator) {
 			return new ConfigServerHealthIndicator(locator);
+		}
+	}
+
+	@ConfigurationProperties("health.config")
+	public static class Health {
+		/**
+		 * Flag to indicate that the config server health indicator should be installed.
+		 */
+		boolean enabled;
+
+		public boolean isEnabled() {
+			return this.enabled;
+		}
+
+		public void setEnabled(boolean enabled) {
+			this.enabled = enabled;
 		}
 	}
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2014 the original author or authors.
+ * Copyright 2013-2015 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,45 +13,33 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.springframework.cloud.config.server;
+package org.springframework.cloud.config.server.encryption;
 
-import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
-import java.security.KeyPair;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.Map.Entry;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.cloud.config.environment.Environment;
-import org.springframework.cloud.config.environment.PropertySource;
-import org.springframework.cloud.context.encrypt.EncryptorFactory;
+import org.springframework.cloud.config.server.ConfigServerProperties;
 import org.springframework.cloud.context.encrypt.KeyFormatException;
-import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.codec.Base64;
 import org.springframework.security.crypto.codec.Hex;
 import org.springframework.security.crypto.encrypt.TextEncryptor;
-import org.springframework.security.rsa.crypto.KeyStoreKeyFactory;
 import org.springframework.security.rsa.crypto.RsaKeyHolder;
-import org.springframework.security.rsa.crypto.RsaSecretEncryptor;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.multipart.MultipartFile;
 
 /**
  * @author Dave Syer
@@ -63,69 +51,45 @@ public class EncryptionController {
 
 	private static Log logger = LogFactory.getLog(EncryptionController.class);
 
-	private TextEncryptor encryptor;
+	volatile private TextEncryptorLocator encryptor;
 
-	@Autowired(required = false)
-	public void setEncryptor(TextEncryptor encryptor) {
+	private final ConfigServerProperties properties;
+
+	private EnvironmentPrefixHelper helper = new EnvironmentPrefixHelper();
+
+	public EncryptionController(TextEncryptorLocator encryptor,
+			ConfigServerProperties configServerProperties) {
 		this.encryptor = encryptor;
+		this.properties = configServerProperties;
 	}
 
 	@RequestMapping(value = "/key", method = RequestMethod.GET)
 	public String getPublicKey() {
+		TextEncryptor encryptor = this.encryptor.locate(this.helper.getEncryptorKeys(
+				"application", "default", ""));
 		if (!(encryptor instanceof RsaKeyHolder)) {
 			throw new KeyNotAvailableException();
 		}
 		return ((RsaKeyHolder) encryptor).getPublicKey();
 	}
 
-	@RequestMapping(value = "/key", method = RequestMethod.POST, params = { "password" })
-	public ResponseEntity<Map<String, Object>> uploadKeyStore(
-			@RequestParam("file") MultipartFile file,
-			@RequestParam("password") String password, @RequestParam("alias") String alias) {
-
-		Map<String, Object> body = new HashMap<String, Object>();
-		body.put("status", "OK");
-
-		try {
-			ByteArrayResource resource = new ByteArrayResource(file.getBytes());
-			KeyPair keyPair = new KeyStoreKeyFactory(resource, password.toCharArray())
-					.getKeyPair(alias);
-			encryptor = new RsaSecretEncryptor(keyPair);
-			body.put("publicKey", ((RsaKeyHolder) encryptor).getPublicKey());
+	@RequestMapping(value = "/key/{name}/{profiles}", method = RequestMethod.GET)
+	public String getPublicKey(@PathVariable String name, @PathVariable String profiles) {
+		TextEncryptor encryptor = this.encryptor.locate(this.helper.getEncryptorKeys(
+				name, profiles, ""));
+		if (!(encryptor instanceof RsaKeyHolder)) {
+			throw new KeyNotAvailableException();
 		}
-		catch (IOException e) {
-			throw new KeyFormatException();
-		}
-		logger.info("Key changed to alias=" + alias);
-
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.CREATED);
-
-	}
-
-	@RequestMapping(value = "/key", method = RequestMethod.POST, params = { "!password" })
-	public ResponseEntity<Map<String, Object>> uploadKey(@RequestBody String data,
-			@RequestHeader("Content-Type") MediaType type) {
-
-		Map<String, Object> body = new HashMap<String, Object>();
-		body.put("status", "OK");
-
-		encryptor = new EncryptorFactory().create(stripFormData(data, type, false));
-
-		if (encryptor instanceof RsaKeyHolder) {
-			body.put("publicKey", ((RsaKeyHolder) encryptor).getPublicKey());
-		}
-		logger.info("Key changed with literal value");
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.CREATED);
-
+		return ((RsaKeyHolder) encryptor).getPublicKey();
 	}
 
 	@ExceptionHandler(KeyFormatException.class)
 	@ResponseBody
 	public ResponseEntity<Map<String, Object>> keyFormat() {
-		Map<String, Object> body = new HashMap<String, Object>();
+		Map<String, Object> body = new HashMap<>();
 		body.put("status", "BAD_REQUEST");
 		body.put("description", "Key data not in correct format (PEM or jks keystore)");
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.BAD_REQUEST);
+		return new ResponseEntity<>(body, HttpStatus.BAD_REQUEST);
 	}
 
 	@ExceptionHandler(KeyNotAvailableException.class)
@@ -134,43 +98,74 @@ public class EncryptionController {
 		Map<String, Object> body = new HashMap<String, Object>();
 		body.put("status", "NOT_FOUND");
 		body.put("description", "No public key available");
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.NOT_FOUND);
+		return new ResponseEntity<>(body, HttpStatus.NOT_FOUND);
 	}
 
 	@RequestMapping(value = "encrypt/status", method = RequestMethod.GET)
 	public Map<String, Object> status() {
-		if (encryptor == null) {
-			throw new KeyNotInstalledException();
-		}
+		checkEncryptorInstalled("application", "default");
 		return Collections.<String, Object> singletonMap("status", "OK");
 	}
 
 	@RequestMapping(value = "encrypt", method = RequestMethod.POST)
 	public String encrypt(@RequestBody String data,
 			@RequestHeader("Content-Type") MediaType type) {
-		if (encryptor == null) {
-			throw new KeyNotInstalledException();
+
+		return encrypt(this.properties.getDefaultApplicationName(),
+				this.properties.getDefaultProfile(), data, type);
+	}
+
+	@RequestMapping(value = "/encrypt/{name}/{profiles}", method = RequestMethod.POST)
+	public String encrypt(@PathVariable String name, @PathVariable String profiles,
+			@RequestBody String data, @RequestHeader("Content-Type") MediaType type) {
+		checkEncryptorInstalled(name, profiles);
+		try {
+			String input = stripFormData(data, type, false);
+			Map<String, String> keys = this.helper
+					.getEncryptorKeys(name, profiles, input);
+			String encrypted = this.helper.addPrefix(keys, this.encryptor.locate(keys)
+					.encrypt(input));
+			logger.info("Encrypted data");
+			return encrypted;
 		}
-		data = stripFormData(data, type, false);
-		String encrypted = encryptor.encrypt(data);
-		logger.info("Encrypted data");
-		return encrypted;
+		catch (IllegalArgumentException e) {
+			throw new InvalidCipherException();
+		}
 	}
 
 	@RequestMapping(value = "decrypt", method = RequestMethod.POST)
 	public String decrypt(@RequestBody String data,
 			@RequestHeader("Content-Type") MediaType type) {
-		if (encryptor == null) {
-			throw new KeyNotInstalledException();
-		}
+
+		return decrypt(this.properties.getDefaultApplicationName(),
+				this.properties.getDefaultProfile(), data, type);
+	}
+
+	@RequestMapping(value = "/decrypt/{name}/{profiles}", method = RequestMethod.POST)
+	public String decrypt(@PathVariable String name, @PathVariable String profiles,
+			@RequestBody String data, @RequestHeader("Content-Type") MediaType type) {
+		checkEncryptorInstalled(name, profiles);
 		try {
-			data = stripFormData(data, type, true);
-			String decrypted = encryptor.decrypt(data);
+			String input = stripFormData(data, type, true);
+			Map<String, String> encryptorKeys = this.helper.getEncryptorKeys(name,
+					profiles, input);
+			TextEncryptor encryptor = this.encryptor.locate(encryptorKeys);
+			String encryptedText = this.helper.stripPrefix(input);
+			String decrypted = this.helper.stripPrefix(encryptor.decrypt(encryptedText));
 			logger.info("Decrypted cipher data");
 			return decrypted;
 		}
 		catch (IllegalArgumentException e) {
 			throw new InvalidCipherException();
+		}
+	}
+
+	private void checkEncryptorInstalled(String name, String profiles) {
+		if (this.encryptor == null
+				|| this.encryptor
+				.locate(this.helper.getEncryptorKeys(name, profiles, ""))
+				.encrypt("FOO").equals("FOO")) {
+			throw new KeyNotInstalledException();
 		}
 	}
 
@@ -186,19 +181,20 @@ public class EncryptionController {
 			catch (UnsupportedEncodingException e) {
 				// Really?
 			}
-			String candidate = data.substring(0, data.length()-1);
+			String candidate = data.substring(0, data.length() - 1);
 			if (cipher) {
 				if (data.endsWith("=")) {
-					 if (data.length()/2!=(data.length()+1)/2) {
-						 try {
-							 Hex.decode(candidate);
-							 return candidate;
-						 } catch (IllegalArgumentException e) {
-							 if (Base64.isBase64(data.getBytes())) {
-								 return data;
-							 }
-						 }
-					 }
+					if (data.length() / 2 != (data.length() + 1) / 2) {
+						try {
+							Hex.decode(candidate);
+							return candidate;
+						}
+						catch (IllegalArgumentException e) {
+							if (Base64.isBase64(data.getBytes())) {
+								return data;
+							}
+						}
+					}
 				}
 				return data;
 			}
@@ -216,7 +212,7 @@ public class EncryptionController {
 		Map<String, Object> body = new HashMap<String, Object>();
 		body.put("status", "NO_KEY");
 		body.put("description", "No key was installed for encryption service");
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.NOT_FOUND);
+		return new ResponseEntity<>(body, HttpStatus.NOT_FOUND);
 	}
 
 	@ExceptionHandler(InvalidCipherException.class)
@@ -225,43 +221,9 @@ public class EncryptionController {
 		Map<String, Object> body = new HashMap<String, Object>();
 		body.put("status", "INVALID");
 		body.put("description", "Text not encrypted with this key");
-		return new ResponseEntity<Map<String, Object>>(body, HttpStatus.BAD_REQUEST);
+		return new ResponseEntity<>(body, HttpStatus.BAD_REQUEST);
 	}
 
-	public Environment decrypt(Environment environment) {
-		Environment result = new Environment(environment.getName(), environment.getProfiles(),
-				environment.getLabel());
-		for (PropertySource source : environment.getPropertySources()) {
-			Map<Object, Object> map = new LinkedHashMap<Object, Object>(
-					source.getSource());
-			for (Entry<Object,Object> entry : new LinkedHashSet<>(map.entrySet())) {
-				Object key = entry.getKey();
-				String name = key.toString();
-				String value = entry.getValue().toString();
-				if (value.startsWith("{cipher}")) {
-					map.remove(key);
-					if (encryptor == null) {
-						map.put(name, value);
-					}
-					else {
-						try {
-							value = value == null ? null : encryptor.decrypt(value
-									.substring("{cipher}".length()));
-						}
-						catch (Exception e) {
-							value = "<n/a>";
-							name = "invalid." + name;
-							logger.warn("Cannot decrypt key: " + key + " ("
-									+ e.getClass() + ": " + e.getMessage() + ")");
-						}
-						map.put(name, value);
-					}
-				}
-			}
-			result.add(new PropertySource(source.getName(), map));
-		}
-		return result;
-	}
 }
 
 @SuppressWarnings("serial")

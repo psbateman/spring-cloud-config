@@ -6,8 +6,6 @@
 
 include::intro.adoc[]
 
-include::https://raw.githubusercontent.com/spring-cloud/spring-cloud-build/master/docs/src/main/asciidoc/contributing-docs.adoc[]
-
 == Quick Start
 
 include::quickstart.adoc[]
@@ -17,7 +15,56 @@ include::quickstart.adoc[]
 The Server provides an HTTP, resource-based API for external
 configuration (name-value pairs, or equivalent YAML content).  The
 server is easily embeddable in a Spring Boot application using the
-`@EnableConfigServer` annotation.
+`@EnableConfigServer` annotation. So this app is a config server:
+
+.ConfigServer.java
+[source,java]
+----
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServer {
+  public static void main(String[] args) {
+    SpringApplication.run(ConfigServer.class, args);
+  }
+}
+----
+
+Like all Spring Boot apps it runs on port 8080 by default, but you
+can switch it to the conventional port 8888 in various ways. The
+easiest, which also sets a default configuration repository, 
+is by launching it with `spring.config.name=configserver` (there 
+is a `configserver.yml` in the Config Server jar). Another is
+to use your own `application.properties`, e.g.
+
+.application.properties
+[source,properties]
+----
+server.port: 8888
+spring.cloud.config.server.git.uri: file://${HOME}/config-repo
+----
+
+where `${HOME}/config-repo` is a git repository containing
+YAML and properties files.
+
+[TIP]
+====
+Here's a recipe for creating the git repository in the example 
+above:
+
+----
+$ cd $HOME
+$ mkdir config-repo
+$ cd config-repo
+$ git init .
+$ echo info.foo: bar > application.properties
+$ git add -A .
+$ git commit -m "Add application.properties"
+----
+====
+
+WARNING: using the local filesystem for your git repository is
+intended for testing only. Use a server to host your 
+configuration repositories in production.
 
 === Environment Repository
 
@@ -88,7 +135,12 @@ filesystem repository, so that the server can clone it and use a local
 working copy as a cache.
 
 This repository implementation maps the `{label}` parameter of the
-HTTP resource to a git label (commit id, branch name or tag).
+HTTP resource to a git label (commit id, branch name or tag). If the
+git branch or tag name contains a slash ("/") then the label in the
+HTTP URL should be specified with the special string "(_)" instead (to
+avoid ambiguity with other URL paths). Be careful with the brackets in
+the URL if you are using a command line client like curl (e.g. escape
+them from the shell with quotes '').
 
 Spring Cloud Config Server supports a single or multiple git
 repositories:
@@ -101,21 +153,26 @@ spring:
         git:
           uri: https://github.com/spring-cloud-samples/config-repo
           repos:
-            simple: https://github.com/pattern1/config-repo
+            simple: https://github.com/simple/config-repo
             special:
               pattern: pattern*,*pattern1*
-              uri: https://github.com/pattern2/config-repo
+              uri: https://github.com/special/config-repo
             local:
               pattern: local*
               uri: file:/home/configsvc/config-repo
 ----
 
-In the above example, if {application} does not match to any of the
+In the above example, if `{application}` does not match any of the
 patterns, it will use the default uri defined under
 "spring.cloud.config.server.git.uri". For the "simple" repository, the
-pattern is "simple" (i.e. it only matches one application).  The
-pattern format is a comma-separated list of application names with
-wildcards.
+pattern is "simple" (i.e. it only matches one application named "simple").
+The pattern format is a comma-separated list of application names with
+wildcards (a pattern beginning with a wildcard may need to be quoted).
+
+NOTE: the "one-liner" short cut used in the "simple" example above can
+only be used if the only property to be set is the URI. If you need to
+set anything else (credentials, pattern, etc.) you need to use the full
+form.
 
 Every repository can also optionally store config files in
 sub-directories, and patterns to search for those directories can be
@@ -134,6 +191,36 @@ spring:
 In this example the server searches for config files in the top level
 and in the "foo/" sub-directory and also any sub-directory whose name
 begins with "bar".
+
+By default the server clones remote repositories when configuration 
+is first requested. The server can be configured to clone the repositories
+at startup. For example at the top level:
+
+----
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://git/common/config-repo.git
+          repos:
+            team-a:
+                pattern: team-a-*
+                cloneOnStart: true
+                uri: http://git/team-a/config-repo.git
+            team-b:
+                pattern: team-b-*
+                cloneOnStart: false
+                uri: http://git/team-b/config-repo.git
+            team-c:
+                pattern: team-c-*
+                uri: http://git/team-a/config-repo.git
+                
+----
+
+In this example the server clones team-a's config-repo on startup before it 
+accepts any requests. All other repositories will not be cloned until 
+configuration from the repository is requested.
 
 To use HTTP basic authentication on the remote repository add the
 "username" and "password" properties separately (not in the URL), 
@@ -182,6 +269,32 @@ loaded from each search location *and* a subdirectory with the same
 name as the label (the labelled properties take precedence in the
 Spring Environment).
 
+=== Health Indicator
+
+Config Server comes with a Health Indicator that checks if the configured
+`EnvironmentRepository` is working.  By default it asks the `EnvironmentRepository`
+for an application named `app`, the `default` profile and the default
+label provided by the `EnvironmentRepository` implementation.
+
+You can configure the Health Indicator to check more applications
+along with custom profiles and custom labels, e.g.
+
+----
+spring:
+  cloud:
+    config:
+      server:
+        health:
+          repositories:
+            myservice:
+              label: mylabel
+            myservice-dev:
+              name: myservice
+              profiles: development
+----
+
+You can disable the Health Indicator by setting `spring.cloud.config.server.health.enabled=false`.
+
 === Security
 
 You are free to secure your Config Server in any way that makes sense
@@ -205,15 +318,13 @@ You can download the "Java Cryptography Extension (JCE) Unlimited Strength Juris
 from Oracle, and follow instructions for installation (essentially replace the 2 policy files
 in the JRE lib/security directory with the ones that you downloaded).
 
-The server exposes `/encrypt` and `/decrypt` endpoints (on the
-assumption that these will be secured and only accessed by authorized
-agents). If the remote property sources contain encryted content
+If the remote property sources contain encryted content
 (values starting with `{cipher}`) they will be decrypted before
 sending to clients over HTTP. The main advantage of this set up is
 that the property values don't have to be in plain text when they are
 "at rest" (e.g. in a git repository). If a value cannot be decrypted
 it is replaced with an empty string, largely to prevent cipher text
-being used as a password in Spring Boot autconfigured HTTP basic.
+being used as a password and accidentally leaking.
 
 If you are setting up a remote config repository for config client
 applications it might contain an `application.yml` like this, for
@@ -224,13 +335,23 @@ instance:
 spring:
   datasource:
     username: dbuser
-    password: {cipher}FKSAJDFGYOS8F7GLHAKERGFHLSAJ
+    password: '{cipher}FKSAJDFGYOS8F7GLHAKERGFHLSAJ'
+----
+
+Encrypted values in a .properties file must not be wrapped in quotes, otherwise the value will not be decrypted:
+
+.application.properties
+----
+spring.datasource.username: dbuser
+spring.datasource.password: {cipher}FKSAJDFGYOS8F7GLHAKERGFHLSAJ
 ----
 
 You can safely push this plain text to a shared git repository and the
 secret password is protected.
 
-If you are editing a remote config file you can use the Config Server
+The server also exposes `/encrypt` and `/decrypt` endpoints (on the
+assumption that these will be secured and only accessed by authorized
+agents). If you are editing a remote config file you can use the Config Server
 to encrypt values by POSTing to the `/encrypt` endpoint, e.g.
 
 ----
@@ -246,9 +367,17 @@ $ curl localhost:8888/decrypt -d 682bc583f4641835fa2db009355293665d2647dade3375c
 mysecret
 ----
 
-Take the encypted value and add the `{cipher}` prefix before you put
+Take the encrypted value and add the `{cipher}` prefix before you put
 it in the YAML or properties file, and before you commit and push it
-to a remote, potentially insecure store.
+to a remote, potentially insecure store. The `/encrypt` and `/decrypt`
+endpoints also both accept paths of the form `/*/{name}/{profiles}`
+which can be used to control cryptography per application (name)
+and profile when clients call into the main Environment resource.
+
+NOTE: to control the cryptography in this granular way you must also 
+provide a `@Bean` of type `TextEncryptorLocator` that creates a
+different encryptor per name and profiles. The one that is provided
+by default does not do this.
 
 The `spring` command line client (with Spring Cloud CLI extensions
 installed) can also be used to encrypt and decrypt, e.g.
@@ -260,7 +389,7 @@ $ spring decrypt --key foo 682bc583f4641835fa2db009355293665d2647dade3375c0ee201
 mysecret
 ----
 
-To use a key in a file (e.g. an RSA public key for encyption) prepend
+To use a key in a file (e.g. an RSA public key for encryption) prepend
 the key value with "@" and provide the file path, e.g.
 
 ----
@@ -279,9 +408,7 @@ it is just a single property value to configure.
 
 To configure a symmetric key you just need to set `encrypt.key` to a
 secret String (or use an enviroment variable `ENCRYPT_KEY` to keep it
-out of plain text configuration files). You can also POST a key value
-to the `/key` endpoint (but that won't change any existing encrypted
-values in remote repositories).
+out of plain text configuration files).
 
 To configure an asymmetric key you can either set the key as a
 PEM-encoded text value (in `encrypt.key`), or via a keystore (e.g. as
@@ -324,6 +451,43 @@ encrypt:
     alias: mytestkey
     secret: changeme
 ----
+
+=== Using Multiple Keys and Key Rotation
+
+In addition to the `{cipher}` prefix in encrypted property values, the
+Config Server looks for `{name:value}` prefixes (zero or many) before
+the start of the (Base64 encoded) cipher text. The keys are passed to
+a `TextEncryptorLocator` which can do whatever logic it needs to
+locate a `TextEncryptor` for the cipher. If you have configured a
+keystore (`encrypt.keystore.location`) the default locator will look
+for keys in the store with aliases as supplied by the "key" prefix,
+i.e. with a cipher text like this:
+
+
+----
+foo:
+  bar: `{cipher}{key:testkey}...`
+----
+
+the locator will look for a key named "testkey". A secret can also be
+supplied via a `{secret:...}` value in the prefix, but if it is not
+the default is to use the keystore password (which is what you get
+when you build a keytore and don't specify a secret). If you *do*
+supply a secret it is recommended that you also encrypt the secrets
+using a custom `SecretLocator`.
+
+Key rotation is hardly ever necessary on cryptographic grounds if the
+keys are only being used to encrypt a few bytes of configuration data
+(i.e. they are not being used elsewhere), but occasionally you might
+need to change the keys if there is a security breach for instance. In
+that case all the clients would need to change their source config
+files (e.g. in git) and use a new `{key:...}` prefix in all the
+ciphers, checking beforehand of course that the key alias is available
+in the Config Server keystore.
+
+TIP: the `{name:value}` prefixes can also be added to plaintext posted
+to the `/encrypt` endpoint, if you want to let the Config Server
+handle all encryption as well as decryption.
 
 === Embedding the Config Server
 
@@ -391,20 +555,38 @@ behavior, set the bootstrap configuration property
 `spring.cloud.config.failFast=true` and the client will halt with
 an Exception.
 
+[[config-client-retry]]
+=== Config Client Retry
+
+If you expect that the config server may occasionally be unavailable when
+your app starts, you can ask it to keep trying after a failure. First you need 
+to set `spring.cloud.config.failFast=true`, and then you need to add
+`spring-retry` and `spring-boot-starter-aop` to your classpath. The default
+behaviour is to retry 6 times with an initial backoff interval of 1000ms and an
+exponential multiplier of 1.1 for subsequent backoffs. You can configure these
+properties (and others) using `spring.config.retry.*` configuration properties.
+
+TIP: To take full control of the retry add a `@Bean` of type
+`RetryOperationsInterceptor` with id "configServerRetryInterceptor". Spring
+Retry has a `RetryInterceptorBuilder` that makes it easy to create one.
+
 === Locating Remote Configuration Resources
 
-The Config Service serves property sources from `/{name}/{env}/{label}`, where the default bindings in the
-client app are
+The Config Service serves property sources from `/{name}/{profile}/{label}`, where the default bindings in the client app are
 
 * "name" = `${spring.application.name}`
-* "env" = `${spring.profiles.active}` (actually `Environment.getActiveProfiles()`)
+* "profile" = `${spring.profiles.active}` (actually `Environment.getActiveProfiles()`)
 * "label" = "master"
 
 All of them can be overridden by setting `spring.cloud.config.\*`
-(where `*` is "name", "env" or "label"). The "label" is useful for
+(where `*` is "name", "profile" or "label"). The "label" is useful for
 rolling back to previous versions of configuration; with the default
 Config Server implementation it can be a git label, branch name or
-commit id.
+commit id. Label can also be provided as a comma-separated list, in 
+which case the items in the list are tried on-by-one until one succeeds.
+This can be useful when working on a feature branch, for instance,
+when you might want to align the config label with your branch, but 
+make it optional (e.g. `spring.cloud.config.label=myfeature,develop`).
 
 === Security
 

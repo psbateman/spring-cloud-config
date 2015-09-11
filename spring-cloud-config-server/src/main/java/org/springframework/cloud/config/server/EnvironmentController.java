@@ -17,8 +17,10 @@ package org.springframework.cloud.config.server;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,10 +29,10 @@ import java.util.TreeMap;
 
 import javax.servlet.http.HttpServletResponse;
 
-import org.yaml.snakeyaml.Yaml;
 import org.springframework.boot.bind.PropertiesConfigurationFactory;
 import org.springframework.cloud.config.environment.Environment;
 import org.springframework.cloud.config.environment.PropertySource;
+import org.springframework.cloud.config.server.encryption.EnvironmentEncryptor;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.MutablePropertySources;
 import org.springframework.http.HttpHeaders;
@@ -42,48 +44,77 @@ import org.springframework.validation.BindException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
+import org.yaml.snakeyaml.DumperOptions.FlowStyle;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.nodes.Tag;
 
 /**
  * @author Dave Syer
  * @author Spencer Gibb
  * @author Roy Clarkson
+ * @author Bartosz Wojtkiewicz
+ * @author Rafal Zukowski
+ *
  */
 @RestController
-@RequestMapping("${spring.cloud.config.server.prefix:}")
+@RequestMapping(method = RequestMethod.GET, value = "${spring.cloud.config.server.prefix:}")
 public class EnvironmentController {
 
 	private static final String MAP_PREFIX = "map";
 
 	private EnvironmentRepository repository;
 
-	private EncryptionController encryption;
+	private EnvironmentEncryptor environmentEncryptor;
 
 	private String defaultLabel;
 
-	private Map<String, String> overrides = new LinkedHashMap<String, String>();
+	private Map<String, String> overrides = new LinkedHashMap<>();
+
+	private boolean stripDocument = true;
 
 	public EnvironmentController(EnvironmentRepository repository,
-			EncryptionController encryption) {
+			EnvironmentEncryptor environmentEncryptor) {
 		super();
 		this.repository = repository;
 		this.defaultLabel = repository.getDefaultLabel();
-		this.encryption = encryption;
+		this.environmentEncryptor = environmentEncryptor;
+	}
+
+	/**
+	 * Flag to indicate that YAML documents which are not a map should be stripped of the
+	 * "document" prefix that is added by Spring (to facilitate conversion to Properties).
+	 * 
+	 * @param stripDocument the flag to set
+	 */
+	public void setStripDocumentFromYaml(boolean stripDocument) {
+		this.stripDocument = stripDocument;
 	}
 
 	@RequestMapping("/{name}/{profiles:.*[^-].*}")
 	public Environment defaultLabel(@PathVariable String name,
 			@PathVariable String profiles) {
-		return labelled(name, profiles, defaultLabel);
+		return labelled(name, profiles, this.defaultLabel);
 	}
 
 	@RequestMapping("/{name}/{profiles}/{label:.*}")
 	public Environment labelled(@PathVariable String name, @PathVariable String profiles,
 			@PathVariable String label) {
-		Environment environment = encryption.decrypt(repository.findOne(name, profiles,
-				label));
-		if (!overrides.isEmpty()) {
-			environment.addFirst(new PropertySource("overrides", overrides));
+		if (label == null) {
+			label = this.defaultLabel;
+		}
+		if (label != null && label.contains("(_)")) {
+			// "(_)" is uncommon in a git branch name, but "/" cannot be matched
+			// by Spring MVC
+			label = label.replace("(_)", "/");
+		}
+		Environment environment = this.repository.findOne(name, profiles, label);
+		if (this.environmentEncryptor != null) {
+			environment = this.environmentEncryptor.decrypt(environment);
+		}
+		if (!this.overrides.isEmpty()) {
+			environment.addFirst(new PropertySource("overrides", this.overrides));
 		}
 		return environment;
 	}
@@ -91,7 +122,7 @@ public class EnvironmentController {
 	@RequestMapping("/{name}-{profiles}.properties")
 	public ResponseEntity<String> properties(@PathVariable String name,
 			@PathVariable String profiles) throws IOException {
-		return labelledProperties(name, profiles, defaultLabel);
+		return labelledProperties(name, profiles, this.defaultLabel);
 	}
 
 	@RequestMapping("/{label}/{name}-{profiles}.properties")
@@ -106,7 +137,7 @@ public class EnvironmentController {
 	@RequestMapping("{name}-{profiles}.json")
 	public ResponseEntity<Map<String, Object>> jsonProperties(@PathVariable String name,
 			@PathVariable String profiles) throws Exception {
-		return labelledJsonProperties(name, profiles, defaultLabel);
+		return labelledJsonProperties(name, profiles, this.defaultLabel);
 	}
 
 	@RequestMapping("/{label}/{name}-{profiles}.json")
@@ -133,7 +164,7 @@ public class EnvironmentController {
 	@RequestMapping({ "/{name}-{profiles}.yml", "/{name}-{profiles}.yaml" })
 	public ResponseEntity<String> yaml(@PathVariable String name,
 			@PathVariable String profiles) throws Exception {
-		return labelledYaml(name, profiles, defaultLabel);
+		return labelledYaml(name, profiles, this.defaultLabel);
 	}
 
 	@RequestMapping({ "/{label}/{name}-{profiles}.yml", "/{label}/{name}-{profiles}.yaml" })
@@ -141,6 +172,16 @@ public class EnvironmentController {
 			@PathVariable String profiles, @PathVariable String label) throws Exception {
 		validateNameAndProfiles(name, profiles);
 		Map<String, Object> result = convertToMap(labelled(name, profiles, label));
+		if (this.stripDocument && result.size() == 1
+				&& result.keySet().iterator().next().equals("document")) {
+			Object value = result.get("document");
+			if (value instanceof Collection) {
+				return getSuccess(new Yaml().dumpAs(value, Tag.SEQ, FlowStyle.BLOCK));
+			}
+			else {
+				return getSuccess(new Yaml().dumpAs(value, Tag.STR, FlowStyle.BLOCK));
+			}
+		}
 		return getSuccess(new Yaml().dumpAsMap(result));
 	}
 
@@ -161,6 +202,11 @@ public class EnvironmentController {
 		@SuppressWarnings("unchecked")
 		Map<String, Object> result = (Map<String, Object>) target.get(MAP_PREFIX);
 		return result == null ? new LinkedHashMap<String, Object>() : result;
+	}
+
+	@ExceptionHandler(NoSuchLabelException.class)
+	public void noSuchLabel(HttpServletResponse response) throws IOException {
+		response.sendError(HttpStatus.NOT_FOUND.value());
 	}
 
 	@ExceptionHandler(IllegalArgumentException.class)
@@ -255,9 +301,10 @@ public class EnvironmentController {
 	}
 
 	private void postProcessProperties(Map<String, Object> propertiesMap) {
-		for (String key : propertiesMap.keySet()) {
+		for (Iterator<String> iter = propertiesMap.keySet().iterator(); iter.hasNext(); ) {
+			String key = iter.next();
 			if (key.equals("spring.profiles")) {
-				propertiesMap.remove(key);
+				iter.remove();
 			}
 		}
 	}

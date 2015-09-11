@@ -16,11 +16,12 @@
 
 package org.springframework.cloud.config.server;
 
+import static org.springframework.util.StringUtils.hasText;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
 
-import com.jcraft.jsch.Session;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.eclipse.jgit.api.CheckoutCommand;
@@ -33,24 +34,24 @@ import org.eclipse.jgit.api.ListBranchCommand.ListMode;
 import org.eclipse.jgit.api.PullCommand;
 import org.eclipse.jgit.api.TransportCommand;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.api.errors.RefNotFoundException;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.transport.JschConfigSessionFactory;
 import org.eclipse.jgit.transport.OpenSshConfig.Host;
 import org.eclipse.jgit.transport.SshSessionFactory;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.eclipse.jgit.util.FileUtils;
-
 import org.springframework.cloud.config.environment.Environment;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.io.UrlResource;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
 
-import static org.springframework.util.StringUtils.hasText;
+import com.jcraft.jsch.Session;
 
 /**
  * An {@link EnvironmentRepository} backed by a single git repository.
- * 
+ *
  * @author Dave Syer
  * @author Roy Clarkson
  */
@@ -59,11 +60,49 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	private static Log logger = LogFactory.getLog(JGitEnvironmentRepository.class);
 
 	private static final String DEFAULT_LABEL = "master";
+	private static final String FILE_URI_PREFIX = "file:";
+
+	/**
+	 * Timeout (in seconds) for obtaining HTTP or SSH connection (if applicable)
+	 */
+	private int timeout = 0;
 
 	private boolean initialized;
 
+	/**
+	 * Flag to indicate that the repository should be cloned on startup (not on demand).
+	 * Generally leads to slower startup but faster first query.
+	 */
+	private boolean cloneOnStart = false;
+
+	private JGitEnvironmentRepository.JGitFactory gitFactory = new JGitEnvironmentRepository.JGitFactory();
+
 	public JGitEnvironmentRepository(ConfigurableEnvironment environment) {
 		super(environment);
+	}
+
+	public boolean isCloneOnStart() {
+		return this.cloneOnStart;
+	}
+
+	public void setCloneOnStart(boolean cloneOnStart) {
+		this.cloneOnStart = cloneOnStart;
+	}
+
+	public int getTimeout() {
+		return this.timeout;
+	}
+
+	public void setTimeout(int timeout) {
+		this.timeout = timeout;
+	}
+
+	public JGitFactory getGitFactory() {
+		return this.gitFactory;
+	}
+
+	public void setGitFactory(JGitFactory gitFactory) {
+		this.gitFactory = gitFactory;
 	}
 
 	@Override
@@ -79,8 +118,11 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 			git = createGitClient();
 			return loadEnvironment(git, application, profile, label);
 		}
+		catch (RefNotFoundException e) {
+			throw new NoSuchLabelException("No such label: " + label);
+		}
 		catch (GitAPIException e) {
-			throw new IllegalStateException("Cannot clone repository", e);
+			throw new IllegalStateException("Cannot clone or checkout repository", e);
 		}
 		catch (Exception e) {
 			throw new IllegalStateException("Cannot load environment", e);
@@ -101,11 +143,29 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	public void afterPropertiesSet() throws Exception {
 		Assert.state(getUri() != null,
 				"You need to configure a uri for the git repository");
+		if (this.cloneOnStart) {
+			initClonedRepository();
+		}
+	}
+
+	/**
+	 * Clones the remote repository and then opens a connection to it.
+	 * @throws GitAPIException
+	 * @throws IOException
+	 */
+	private void initClonedRepository() throws GitAPIException, IOException {
+		if (!getUri().startsWith(FILE_URI_PREFIX)) {
+			deleteBaseDirIfExists();
+			cloneToBasedir();
+			openGitRepository();
+		}
+
 	}
 
 	private synchronized Environment loadEnvironment(Git git, String application,
 			String profile, String label) throws GitAPIException {
-		NativeEnvironmentRepository environment = new NativeEnvironmentRepository(getEnvironment());
+		NativeEnvironmentRepository environment = new NativeEnvironmentRepository(
+				getEnvironment());
 		git.getRepository().getConfig().setString("branch", label, "merge", label);
 		Ref ref = checkout(git, label);
 		if (shouldPull(git, ref)) {
@@ -130,9 +190,8 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	}
 
 	private boolean shouldPull(Git git, Ref ref) throws GitAPIException {
-		return git.status().call().isClean()
-				&& ref != null
-				&& git.getRepository().getConfig().getString("remote", "origin", "url") != null;
+		return git.status().call().isClean() && ref != null && git.getRepository()
+				.getConfig().getString("remote", "origin", "url") != null;
 	}
 
 	private boolean shouldTrack(Git git, String label) throws GitAPIException {
@@ -144,6 +203,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	 */
 	private void pull(Git git, String label, Ref ref) {
 		PullCommand pull = git.pull();
+		setTimeout(pull);
 		try {
 			if (hasText(getUsername())) {
 				setCredentialsProvider(pull);
@@ -151,13 +211,9 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 			pull.call();
 		}
 		catch (Exception e) {
-			logger.warn("Could not pull remote for "
-					+ label
-					+ " (current ref="
-					+ ref
-					+ "), remote: "
-					+ git.getRepository().getConfig()
-							.getString("remote", "origin", "url"));
+			logger.warn("Could not pull remote for " + label + " (current ref=" + ref
+					+ "), remote: " + git.getRepository().getConfig().getString("remote",
+							"origin", "url"));
 		}
 	}
 
@@ -170,10 +226,14 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 		}
 	}
 
-	private Git copyRepository() throws IOException, GitAPIException {
+	// Synchronize here so that multiple requests don't all try and delete the base dir
+	// together (this is a once only operation, so it only holds things up on the first
+	// request).
+	private synchronized Git copyRepository() throws IOException, GitAPIException {
 		deleteBaseDirIfExists();
-		Assert.state(getBasedir().mkdirs(), "Could not create basedir: " + getBasedir());
-		if (getUri().startsWith("file:")) {
+		getBasedir().mkdirs();
+		Assert.state(getBasedir().exists(), "Could not create basedir: " + getBasedir());
+		if (getUri().startsWith(FILE_URI_PREFIX)) {
 			return copyFromLocalRepository();
 		}
 		else {
@@ -182,7 +242,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	}
 
 	private Git openGitRepository() throws IOException {
-		Git git = Git.open(getWorkingDirectory());
+		Git git = this.gitFactory.getGitByOpen(getWorkingDirectory());
 		tryFetch(git);
 		return git;
 	}
@@ -194,13 +254,14 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 		File gitDir = new File(remote, ".git");
 		Assert.state(gitDir.exists(), "No .git at " + getUri());
 		Assert.state(gitDir.isDirectory(), "No .git directory at " + getUri());
-		git = Git.open(remote);
+		git = this.gitFactory.getGitByOpen(remote);
 		return git;
 	}
 
 	private Git cloneToBasedir() throws GitAPIException {
-		CloneCommand clone = Git.cloneRepository().setURI(getUri())
-				.setDirectory(getBasedir());
+		CloneCommand clone = this.gitFactory.getCloneCommandByCloneRepository()
+				.setURI(getUri()).setDirectory(getBasedir());
+		setTimeout(clone);
 		if (hasText(getUsername())) {
 			setCredentialsProvider(clone);
 		}
@@ -210,6 +271,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	private void tryFetch(Git git) {
 		try {
 			FetchCommand fetch = git.fetch();
+			setTimeout(fetch);
 			if (hasText(getUsername())) {
 				setCredentialsProvider(fetch);
 			}
@@ -232,26 +294,30 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 	}
 
 	private void initialize() {
-		if (getUri().startsWith("file:") && !initialized) {
+		if (getUri().startsWith("file:") && !this.initialized) {
 			SshSessionFactory.setInstance(new JschConfigSessionFactory() {
 				@Override
 				protected void configure(Host hc, Session session) {
 					session.setConfig("StrictHostKeyChecking", "no");
 				}
 			});
-			initialized = true;
+			this.initialized = true;
 		}
 	}
 
 	private void setCredentialsProvider(TransportCommand<?, ?> cmd) {
-		cmd.setCredentialsProvider(new UsernamePasswordCredentialsProvider(getUsername(),
-				getPassword()));
+		cmd.setCredentialsProvider(
+				new UsernamePasswordCredentialsProvider(getUsername(), getPassword()));
+	}
+
+	private void setTimeout(TransportCommand<?, ?> pull) {
+		pull.setTimeout(this.timeout);
 	}
 
 	private void trackBranch(Git git, CheckoutCommand checkout, String label) {
 		checkout.setCreateBranch(true).setName(label)
-				.setUpstreamMode(SetupUpstreamMode.TRACK)
-				.setStartPoint("origin/" + label);
+		.setUpstreamMode(SetupUpstreamMode.TRACK)
+		.setStartPoint("origin/" + label);
 	}
 
 	private boolean isBranch(Git git, String label) throws GitAPIException {
@@ -275,5 +341,22 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository 
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Wraps the static method calls to {@link org.eclipse.jgit.api.Git} and
+	 * {@link org.eclipse.jgit.api.CloneCommand} allowing for easier unit testing.
+	 */
+	static class JGitFactory {
+
+		public Git getGitByOpen(File file) throws IOException {
+			Git git = Git.open(file);
+			return git;
+		}
+
+		public CloneCommand getCloneCommandByCloneRepository() {
+			CloneCommand command = Git.cloneRepository();
+			return command;
+		}
 	}
 }

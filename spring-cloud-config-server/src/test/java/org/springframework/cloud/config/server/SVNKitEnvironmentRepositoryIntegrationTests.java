@@ -31,10 +31,10 @@ import org.tmatesoft.svn.core.wc2.SvnCheckout;
 import org.tmatesoft.svn.core.wc2.SvnCommit;
 import org.tmatesoft.svn.core.wc2.SvnOperationFactory;
 import org.tmatesoft.svn.core.wc2.SvnTarget;
-
 import org.springframework.boot.autoconfigure.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.cloud.config.environment.Environment;
+import org.springframework.cloud.config.server.config.EnvironmentRepositoryConfiguration;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -129,7 +129,7 @@ public class SVNKitEnvironmentRepositoryIntegrationTests {
 		assertEquals("trunk", repository.getDefaultLabel());
 	}
 
-	@Test
+	@Test(expected=NoSuchLabelException.class)
 	public void invalidLabel() throws Exception {
 		String uri = ConfigServerTestUtils.prepareLocalSvnRepo(
 				"src/test/resources/svn-config-repo", "target/config");
@@ -143,7 +143,7 @@ public class SVNKitEnvironmentRepositoryIntegrationTests {
 	}
 
 	@Configuration
-	@Import({ PropertyPlaceholderAutoConfiguration.class, ConfigServerConfiguration.class })
+	@Import({ PropertyPlaceholderAutoConfiguration.class, EnvironmentRepositoryConfiguration.class })
 	protected static class TestConfiguration {
 	}
 
